@@ -22,7 +22,6 @@ VIDEO_EXTS = {".mp4", ".m4v", ".mov", ".mkv", ".avi", ".flv", ".ts", ".m2ts", ".
 
 def setup_logging(verbose: bool):
     level = logging.INFO if verbose else logging.WARNING
-    # 加入时间戳与线程名，便于并发日志阅读
     logging.basicConfig(
         level=level,
         format="%(asctime)s %(levelname)s [%(threadName)s] %(message)s",
@@ -33,8 +32,8 @@ def setup_logging(verbose: bool):
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Move/copy SRC -> DST, rsync-like with size+hash, conflict rename. "
-                    "Optimized for big files (video signature + adaptive sampled hash). Safe deletion & concurrency."
+        description="Move/copy SRC -> DST, rsync-like merge with safe delete. "
+                    "Fast paths: name+size trust, ffprobe video signature, adaptive sampled hashing."
     )
     p.add_argument("src", help="Source directory")
     p.add_argument("dst", help="Destination directory")
@@ -46,6 +45,10 @@ def parse_args():
                    help="When pruning empty dirs under SRC, keep SRC root directory (do not remove it).")
     p.add_argument("--fsync-before-delete", action="store_true",
                    help="fsync the destination file before deleting the source (safer across disks/power loss; slower).")
+
+    # ultra-fast label equality
+    p.add_argument("--trust-name-size", action="store_true",
+                   help="If destination has same relative path (same name) AND same size, treat as identical without any hashing (fastest, small risk).")
 
     # hashing
     p.add_argument("--algo", default="auto", choices=["auto", "blake3", "blake2b", "sha256", "md5"],
@@ -63,7 +66,7 @@ def parse_args():
     p.add_argument("--max-sampled-bytes", type=int, default=64 * 1024 * 1024,
                    help="Adaptive sampled-hash: upper bound on total sampled bytes (default: 64 MiB).")
     p.add_argument("--trust-sampled", action="store_true",
-                   help="If sampled-hash equals, treat as identical without full-hash (faster, tiny risk).")
+                   help="If sampled-hash equals, treat as identical without full-hash (faster).")
 
     # video fast signature (ffprobe)
     p.add_argument("--use-video-signature", action="store_true",
@@ -313,7 +316,7 @@ def safe_delete_if_unchanged(src_file: Path, snap: os.stat_result, dry_run: bool
         logging.warning(f"Stat before delete failed {src_file}: {e}")
         return False
     if now.st_size != snap.st_size or int(now.st_mtime) != int(snap.st_mtime):
-        logging.warning(f"Skip delete (changed after hash): {src_file}")
+        logging.warning(f"Skip delete (changed after hash/label): {src_file}")
         return False
     return delete_file(src_file, dry_run)
 
@@ -323,7 +326,7 @@ def handle_one_file(
     src_file: Path, rel_path: Path, dst_root: Path,
     quick_bytes: int, big_threshold: int,
     sampled_chunk_size: int, samples_per_gib: int, max_sampled_bytes: int,
-    use_video_signature: bool, trust_video_signature: bool, trust_sampled: bool,
+    use_video_signature: bool, trust_video_signature: bool, trust_sampled: bool, trust_name_size: bool,
     new_hasher, follow_symlinks: bool,
     delete_source: bool, fsync_before_delete: bool, dry_run: bool, copy_sem: threading.Semaphore,
     counters: dict, failed_files: List[str]
@@ -339,7 +342,6 @@ def handle_one_file(
             add_failed(failed_files, str(src_file))
             return
 
-        # <<< 新增：当前处理文件日志 >>>
         logging.info(f"[START] {rel_path} | size={src_stat.st_size} | src={src_file} | dst={dst_file}")
 
         if not dst_file.exists():
@@ -375,6 +377,16 @@ def handle_one_file(
                     logging.warning(f"fsync failed for {new_name}: {e}")
                     inc(counters, "errors")
             inc(counters, "renamed_conflicts")
+            if delete_source:
+                if safe_delete_if_unchanged(src_file, src_stat, dry_run):
+                    inc(counters, "deleted")
+            return
+
+        # ===== Ultra-fast path: trust name + size =====
+        if trust_name_size:
+            # 相对路径同名已成立（rel_path 一致），size 也相等 -> 直接判相同
+            logging.info(f"[FAST-NAME-SIZE] Treat as identical (no hashing): {rel_path}")
+            inc(counters, "skipped_identical")
             if delete_source:
                 if safe_delete_if_unchanged(src_file, src_stat, dry_run):
                     inc(counters, "deleted")
@@ -430,6 +442,7 @@ def handle_one_file(
                         inc(counters, "deleted")
                 return
 
+            # fallback to full hash to confirm (safer; slower)
             try:
                 s_full = file_full_hash(src_file, new_hasher)
                 d_full = file_full_hash(dst_file, new_hasher)
@@ -556,7 +569,8 @@ def main():
     logging.info(
         f"Hash={algo_name} | quick={args.quick_bytes} | big≥{args.big_threshold} | "
         f"sampled(adaptive): chunk={args.sampled_chunk_size}, perGiB={args.samples_per_gib}, max={args.max_sampled_bytes} | "
-        f"trust_sampled={args.trust_sampled} | video_sig={args.use_video_signature}, trust_video_sig={args.trust_video_signature} | "
+        f"trust_name_size={args.trust_name_size} | trust_sampled={args.trust_sampled} | "
+        f"video_sig={args.use_video_signature}, trust_video_sig={args.trust_video_signature} | "
         f"workers={args.workers}, max_copy={args.max_copy}, fsync_before_delete={args.fsync_before_delete}"
     )
 
@@ -580,7 +594,7 @@ def main():
                 src_file, rel_path, dst_root,
                 args.quick_bytes, args.big_threshold,
                 args.sampled_chunk_size, args.samples_per_gib, args.max_sampled_bytes,
-                args.use_video_signature, args.trust_video_signature, args.trust_sampled,
+                args.use_video_signature, args.trust_video_signature, args.trust_sampled, args.trust_name_size,
                 new_hasher_fn, args.follow_symlinks,
                 args.delete_source, args.fsync_before_delete, args.dry_run, copy_sem,
                 counters, failed_files
