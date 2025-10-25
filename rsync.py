@@ -8,24 +8,33 @@ import os
 import shutil
 import sys
 import time
+import json
+import subprocess
 from pathlib import Path
 from typing import Iterable, Iterator, Tuple, Optional, List
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 
 CHUNK_SIZE = 1024 * 1024  # 1 MiB
+VIDEO_EXTS = {".mp4", ".m4v", ".mov", ".mkv", ".avi", ".flv", ".ts", ".m2ts", ".wmv", ".webm"}
 
 # ---------------- Logging ----------------
 
 def setup_logging(verbose: bool):
     level = logging.INFO if verbose else logging.WARNING
-    logging.basicConfig(level=level, format="%(levelname)s: %(message)s")
+    # 加入时间戳与线程名，便于并发日志阅读
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)s [%(threadName)s] %(message)s",
+        datefmt="%H:%M:%S"
+    )
 
 # ---------------- Args ----------------
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Move/copy SRC -> DST, rsync-like with size+hash, conflict rename, sampled hashing for big files. Safe deletion & concurrency."
+        description="Move/copy SRC -> DST, rsync-like with size+hash, conflict rename. "
+                    "Optimized for big files (video signature + adaptive sampled hash). Safe deletion & concurrency."
     )
     p.add_argument("src", help="Source directory")
     p.add_argument("dst", help="Destination directory")
@@ -43,14 +52,24 @@ def parse_args():
                    help="Hash algorithm. 'auto' prefers blake3, else blake2b, else sha256.")
     p.add_argument("--quick-bytes", type=int, default=4 * 1024 * 1024,
                    help="Head quick-hash bytes before full-hash for small/medium files (0 to disable).")
+
+    # big-file optimization (adaptive sampled hashing)
     p.add_argument("--big-threshold", type=int, default=512 * 1024 * 1024,
                    help="Size threshold (bytes) to use sampled-hash for big files. Default: 512 MiB.")
-    p.add_argument("--sampled-chunks", type=int, default=3,
-                   help="Number of sample chunks for big files (front/center/end = 3).")
     p.add_argument("--sampled-chunk-size", type=int, default=8 * 1024 * 1024,
-                   help="Each sample chunk size in bytes (default: 8 MiB; larger更稳).")
+                   help="Each sample chunk size in bytes (default: 8 MiB).")
+    p.add_argument("--samples-per-gib", type=int, default=6,
+                   help="Adaptive sampled-hash: samples per GiB (default: 6).")
+    p.add_argument("--max-sampled-bytes", type=int, default=64 * 1024 * 1024,
+                   help="Adaptive sampled-hash: upper bound on total sampled bytes (default: 64 MiB).")
     p.add_argument("--trust-sampled", action="store_true",
                    help="If sampled-hash equals, treat as identical without full-hash (faster, tiny risk).")
+
+    # video fast signature (ffprobe)
+    p.add_argument("--use-video-signature", action="store_true",
+                   help="Use ffprobe-based video signature as fastest equality check for common video types.")
+    p.add_argument("--trust-video-signature", action="store_true",
+                   help="If video signatures equal, treat as identical without further hashing.")
 
     # io & traversal
     p.add_argument("--ignore", action="append", default=[".DS_Store"],
@@ -58,7 +77,7 @@ def parse_args():
     p.add_argument("--follow-symlinks", action="store_true",
                    help="Follow symlinks when copying. Default: copy link itself where possible.")
     p.add_argument("--dry-run", action="store_true", help="Plan only, do not copy/rename/delete.")
-    p.add_argument("-v", "--verbose", action="store_true", help="Verbose logs.")
+    p.add_argument("-v", "--verbose", action="store_true", help="Verbose logs (prints per-file [START] lines).")
     p.add_argument("--workers", type=int, default=max(4, (os.cpu_count() or 4) * 2),
                    help="Thread pool size for hashing/copying (I/O-bound).")
     p.add_argument("--max-copy", type=int, default=4,
@@ -112,10 +131,10 @@ def file_full_hash(path: Path, new_hasher) -> str:
             h.update(buf)
     return h.hexdigest()
 
-def file_sampled_hash(path: Path, new_hasher, file_size: int, chunks: int, chunk_size: int) -> str:
-    assert chunks >= 1 and chunk_size > 0
+def file_sampled_hash_adaptive(path: Path, new_hasher, file_size: int,
+                               chunk_size: int, samples_per_gib: int, max_total: int) -> str:
     h = new_hasher()
-    if file_size <= chunk_size * chunks:
+    if file_size <= chunk_size:
         with path.open("rb") as f:
             while True:
                 buf = f.read(CHUNK_SIZE)
@@ -124,9 +143,15 @@ def file_sampled_hash(path: Path, new_hasher, file_size: int, chunks: int, chunk
                 h.update(buf)
         return h.hexdigest()
 
+    gib = (file_size + (1 << 30) - 1) // (1 << 30)
+    num = max(3, samples_per_gib * max(1, gib))
+    num = min(num, max(1, max_total // chunk_size))
+    if num <= 1:
+        num = 3
+
     with path.open("rb") as f:
-        for i in range(chunks):
-            t = 0.0 if chunks == 1 else i / (chunks - 1)  # 0..1
+        for i in range(num):
+            t = i / (num - 1) if num > 1 else 0.0
             pos = int((file_size - chunk_size) * t)
             f.seek(pos, os.SEEK_SET)
             left = chunk_size
@@ -137,6 +162,59 @@ def file_sampled_hash(path: Path, new_hasher, file_size: int, chunks: int, chunk
                 h.update(buf)
                 left -= len(buf)
     return h.hexdigest()
+
+# --------- Video fast signature (ffprobe) ----------
+
+def ffprobe_signature(path: Path, new_hasher) -> Optional[str]:
+    try:
+        cmd = [
+            "ffprobe", "-v", "quiet",
+            "-select_streams", "v:a:s",
+            "-count_frames", "-show_streams", "-show_format",
+            "-of", "json", str(path)
+        ]
+        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT)
+        data = json.loads(out.decode("utf-8", "ignore"))
+
+        fmt = data.get("format", {})
+        dur = fmt.get("duration")
+        br  = fmt.get("bit_rate")
+        size = fmt.get("size")
+        start = fmt.get("start_time")
+        tags = fmt.get("tags", {}) or {}
+        tags.pop("encoder", None)
+
+        streams = []
+        for s in data.get("streams", []):
+            keep = {
+                "codec_type": s.get("codec_type"),
+                "codec_name": s.get("codec_name"),
+                "profile": s.get("profile"),
+                "level": s.get("level"),
+                "width": s.get("width"),
+                "height": s.get("height"),
+                "sample_rate": s.get("sample_rate"),
+                "channels": s.get("channels"),
+                "channel_layout": s.get("channel_layout"),
+                "bit_rate": s.get("bit_rate"),
+                "nb_frames": s.get("nb_frames") or s.get("nb_read_frames"),
+                "avg_frame_rate": s.get("avg_frame_rate"),
+                "r_frame_rate": s.get("r_frame_rate"),
+                "tags": s.get("tags", {}) or {},
+            }
+            keep["tags"].pop("encoder", None)
+            streams.append(keep)
+
+        sig_obj = {
+            "duration": dur, "bit_rate": br, "size": size, "start_time": start,
+            "format_tags": tags, "streams": streams
+        }
+        sig_json = json.dumps(sig_obj, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        h = new_hasher()
+        h.update(sig_json)
+        return h.hexdigest()
+    except Exception:
+        return None
 
 # ---------------- FS helpers ----------------
 
@@ -229,16 +307,11 @@ def add_failed(lst: List[str], path: str):
 # ---------------- Safe deletion with TOCTOU guard ----------------
 
 def safe_delete_if_unchanged(src_file: Path, snap: os.stat_result, dry_run: bool) -> bool:
-    """
-    Delete only if src_file's size & mtime unchanged vs snapshot.
-    """
     try:
         now = src_file.stat()
     except Exception as e:
         logging.warning(f"Stat before delete failed {src_file}: {e}")
         return False
-
-    # compare size + int mtime (coarse but robust;可按需加 ino 对同设备更严谨)
     if now.st_size != snap.st_size or int(now.st_mtime) != int(snap.st_mtime):
         logging.warning(f"Skip delete (changed after hash): {src_file}")
         return False
@@ -248,14 +321,16 @@ def safe_delete_if_unchanged(src_file: Path, snap: os.stat_result, dry_run: bool
 
 def handle_one_file(
     src_file: Path, rel_path: Path, dst_root: Path,
-    quick_bytes: int, big_threshold: int, sampled_chunks: int, sampled_chunk_size: int,
-    trust_sampled: bool, new_hasher, follow_symlinks: bool,
+    quick_bytes: int, big_threshold: int,
+    sampled_chunk_size: int, samples_per_gib: int, max_sampled_bytes: int,
+    use_video_signature: bool, trust_video_signature: bool, trust_sampled: bool,
+    new_hasher, follow_symlinks: bool,
     delete_source: bool, fsync_before_delete: bool, dry_run: bool, copy_sem: threading.Semaphore,
     counters: dict, failed_files: List[str]
 ):
     dst_file = dst_root / rel_path
     try:
-        # take early snapshot for safe delete
+        # early snapshot for safe delete
         try:
             src_stat = src_file.stat()
         except Exception as e:
@@ -263,6 +338,9 @@ def handle_one_file(
             inc(counters, "errors")
             add_failed(failed_files, str(src_file))
             return
+
+        # <<< 新增：当前处理文件日志 >>>
+        logging.info(f"[START] {rel_path} | size={src_stat.st_size} | src={src_file} | dst={dst_file}")
 
         if not dst_file.exists():
             copy_file(src_file, dst_file, follow_symlinks, dry_run, copy_sem)
@@ -288,7 +366,6 @@ def handle_one_file(
             return
 
         if src_stat.st_size != dst_stat.st_size:
-            # conflict by size
             new_name = conflict_name(dst_file)
             copy_file(src_file, new_name, follow_symlinks, dry_run, copy_sem)
             if fsync_before_delete and not dry_run:
@@ -303,11 +380,28 @@ def handle_one_file(
                     inc(counters, "deleted")
             return
 
-        # same size: big file fast path via sampled hash
+        # same size: video fast signature (if enabled & video-like)
+        if use_video_signature and src_file.suffix.lower() in VIDEO_EXTS:
+            sig_s = ffprobe_signature(src_file, new_hasher)
+            sig_d = ffprobe_signature(dst_file, new_hasher)
+            if sig_s and sig_d and sig_s == sig_d:
+                inc(counters, "skipped_identical")
+                if delete_source:
+                    if safe_delete_if_unchanged(src_file, src_stat, dry_run):
+                        inc(counters, "deleted")
+                return
+
+        # big files: adaptive sampled hashing (bounded I/O)
         if src_stat.st_size >= big_threshold:
             try:
-                s_samp = file_sampled_hash(src_file, new_hasher, src_stat.st_size, sampled_chunks, sampled_chunk_size)
-                d_samp = file_sampled_hash(dst_file, new_hasher, dst_stat.st_size, sampled_chunks, sampled_chunk_size)
+                s_samp = file_sampled_hash_adaptive(
+                    src_file, new_hasher, src_stat.st_size,
+                    sampled_chunk_size, samples_per_gib, max_sampled_bytes
+                )
+                d_samp = file_sampled_hash_adaptive(
+                    dst_file, new_hasher, dst_stat.st_size,
+                    sampled_chunk_size, samples_per_gib, max_sampled_bytes
+                )
             except Exception as e:
                 logging.warning(f"Sampled-hash failed {src_file} or {dst_file}: {e}")
                 inc(counters, "errors")
@@ -329,15 +423,13 @@ def handle_one_file(
                         inc(counters, "deleted")
                 return
 
-            # sampled equal: trust or verify
-            if trust_sampled:
+            if trust_sampled or (trust_video_signature and use_video_signature):
                 inc(counters, "skipped_identical")
                 if delete_source:
                     if safe_delete_if_unchanged(src_file, src_stat, dry_run):
                         inc(counters, "deleted")
                 return
 
-            # full hash to confirm
             try:
                 s_full = file_full_hash(src_file, new_hasher)
                 d_full = file_full_hash(dst_file, new_hasher)
@@ -444,8 +536,7 @@ def main():
 
     # forbid dst inside src (防止“自吞”)
     try:
-        # Python 3.9+: Path.is_relative_to
-        if dst_root.is_relative_to(src_root):
+        if dst_root.is_relative_to(src_root):  # py3.9+
             logging.error("Destination directory must NOT be inside the source directory.")
             sys.exit(2)
     except AttributeError:
@@ -464,8 +555,9 @@ def main():
     algo_name, new_hasher_fn = pick_hasher(args.algo)
     logging.info(
         f"Hash={algo_name} | quick={args.quick_bytes} | big≥{args.big_threshold} | "
-        f"sampled={args.sampled_chunks}×{args.sampled_chunk_size} | trust_sampled={args.trust_sampled} | "
-        f"workers={args.workers} | max_copy={args.max_copy} | fsync_before_delete={args.fsync_before_delete}"
+        f"sampled(adaptive): chunk={args.sampled_chunk_size}, perGiB={args.samples_per_gib}, max={args.max_sampled_bytes} | "
+        f"trust_sampled={args.trust_sampled} | video_sig={args.use_video_signature}, trust_video_sig={args.trust_video_signature} | "
+        f"workers={args.workers}, max_copy={args.max_copy}, fsync_before_delete={args.fsync_before_delete}"
     )
 
     counters = {
@@ -480,22 +572,22 @@ def main():
 
     copy_sem = threading.Semaphore(args.max_copy)
 
-    # process files concurrently
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         futures = []
         for src_file, rel_path in walk_files(src_root, args.ignore):
             futures.append(pool.submit(
                 handle_one_file,
                 src_file, rel_path, dst_root,
-                args.quick_bytes, args.big_threshold, args.sampled_chunks, args.sampled_chunk_size,
-                args.trust_sampled, new_hasher_fn, args.follow_symlinks,
+                args.quick_bytes, args.big_threshold,
+                args.sampled_chunk_size, args.samples_per_gib, args.max_sampled_bytes,
+                args.use_video_signature, args.trust_video_signature, args.trust_sampled,
+                new_hasher_fn, args.follow_symlinks,
                 args.delete_source, args.fsync_before_delete, args.dry_run, copy_sem,
                 counters, failed_files
             ))
         for _ in as_completed(futures):
             pass
 
-    # prune empty dirs bottom-up
     if args.delete_source:
         for dirpath, dirnames, filenames in os.walk(src_root, topdown=False):
             if filenames or dirnames:
@@ -513,7 +605,6 @@ def main():
                 inc(counters, "errors")
                 add_failed(failed_dirs, str(p))
 
-    # summary
     moved_total = counters["copied"] + counters["renamed_conflicts"]
 
     print("\n=== Summary ===")
